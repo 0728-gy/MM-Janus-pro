@@ -13,7 +13,10 @@ import json
 import argparse
 from tqdm import tqdm
 
-
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_PROCID", 0)))
+WORLD_SIZE = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", 1)))
+torch.cuda.set_device(LOCAL_RANK)
+DEVICE = f"cuda:{LOCAL_RANK}"
 # ============================================================
 # 核心生成函数（不变，保留 TTS 逻辑）
 # ============================================================
@@ -276,13 +279,15 @@ def generate_for_geneval(
             if line:
                 prompts.append(json.loads(line))
 
-    print(f"Total prompts: {len(prompts)}, generating {num_images_per_prompt} images each.")
-    print(f"Starting from index: {start_idx}")
+    if LOCAL_RANK == 0:
+        print(f"Total prompts: {len(prompts)}, generating {num_images_per_prompt} images each.")
+        print(f"Starting from index: {start_idx}")
 
-    for global_idx, meta in enumerate(tqdm(prompts, desc="Prompts")):
+    for global_idx, meta in enumerate(tqdm(prompts, desc="Prompts", disable=(LOCAL_RANK != 0))):
         if global_idx < start_idx:
             continue
-
+        if global_idx % WORLD_SIZE != LOCAL_RANK:
+            continue
         prompt_text = meta["prompt"]
         prompt_dir = os.path.join(output_dir, f"{global_idx:05d}")
         os.makedirs(prompt_dir, exist_ok=True)
@@ -328,15 +333,15 @@ def generate_for_geneval(
 def parse_args():
     parser = argparse.ArgumentParser(description="Janus-Pro GenEval Image Generation with TTS")
     parser.add_argument("--model_path", type=str,
-                        default="/share/home/u11154/JingyiLiu/MM2026/Janus/model_weights/Janus-Pro-7B")
+                        default="/share/home/u11154/JingyiLiu/MM2026/Janus_ex_data/model_weights/Janus-Pro-7B")
     parser.add_argument("--metadata_path", type=str, required=True,
                         help="/share/home/u11154/JingyiLiu/MM2026/geneval/prompts/evaluation_metadata.jsonl")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Root output directory")
     parser.add_argument("--num_images_per_prompt", type=int, default=4,
                         help="Number of images to generate per prompt")
-    parser.add_argument("--cfg_weight", type=float, default=10.0)
-    parser.add_argument("--sigma", type=float, default=7.0,
+    parser.add_argument("--cfg_weight", type=float, default=9.0)
+    parser.add_argument("--sigma", type=float, default=15.0,
                         help="Entropy threshold for TTS backtracking")
     parser.add_argument("--d", type=int, default=8,
                         help="Window size for TTS")
@@ -350,14 +355,18 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    print(f"Loading model from: {args.model_path}")
+    if LOCAL_RANK == 0:
+        print(f"Loading model from: {args.model_path}")
+
     vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained(args.model_path)
 
     vl_gpt: MultiModalityCausalLM = AutoModelForCausalLM.from_pretrained(
         args.model_path, trust_remote_code=True
     )
-    vl_gpt = vl_gpt.to(torch.bfloat16).cuda().eval()
-    print("Model loaded.")
+    vl_gpt = vl_gpt.to(torch.bfloat16).to(DEVICE).eval()
+
+    if LOCAL_RANK == 0:
+        print("Model loaded.")
 
     generate_for_geneval(
         mmgpt=vl_gpt,
