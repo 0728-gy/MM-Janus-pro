@@ -41,6 +41,7 @@ def generate_single_image(
     d: int = 8,
     sigma: float = 7.0,
     beam_size: int = 3,
+    temperature:float =0.95
 ) -> np.ndarray:
     """
     对单个 prompt 生成一张图，返回 np.ndarray (H, W, 3) uint8。
@@ -69,21 +70,21 @@ def generate_single_image(
     generated_tokens = []
     token_entropies = []
     history_hidden_states = []
+    history_hidden_states.append(last_hidden_state)
 
     t_fast = 0
     t_slow = 0
 
     while len(generated_tokens) < image_token_num_per_image:
 
-        history_hidden_states.append(last_hidden_state)
 
         logits = mmgpt.gen_head(last_hidden_state)
         logit_cond = logits[0, :]
         logit_uncond = logits[1, :]
         final_logits = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
 
-        probs = torch.softmax(final_logits/0.95, dim=-1)
-        log_probs = torch.log_softmax(final_logits, dim=-1)
+        probs = torch.softmax(final_logits/temperature, dim=-1)
+        log_probs = torch.log_softmax(final_logits/temperature, dim=-1)
         entropy = -torch.sum(probs * log_probs, dim=-1).item()
 
         next_token = torch.multinomial(probs, num_samples=1)
@@ -101,6 +102,7 @@ def generate_single_image(
             past_key_values=past_key_values,
         )
         last_hidden_state = outputs.last_hidden_state[:, -1, :]
+        history_hidden_states.append(last_hidden_state)
 
         t_fast += 1
         t_slow += 1
@@ -164,9 +166,16 @@ def generate_single_image(
                     for b_idx in beam_indices:
                         cache_indices.append(2 * b_idx)
                         cache_indices.append(2 * b_idx + 1)
-                    past_key_values.reorder_cache(
-                        torch.tensor(cache_indices, device=_device)
-                    )
+
+                    cache_indices_tensor = torch.tensor(cache_indices, dtype=torch.long, device=_device)
+
+                    # ------------------------------------------------------------------
+                    # ✅ 修复 Bug 2：同步重排历史隐状态，防止路径交叉产生缝合怪！
+                    for i in range(len(beam_history_hiddens)):
+                        beam_history_hiddens[i] = beam_history_hiddens[i][cache_indices_tensor]
+
+                    
+                    past_key_values.reorder_cache(cache_indices_tensor)
 
                     next_tokens_input = token_indices.repeat_interleave(2)
                     img_embeds = mmgpt.prepare_gen_img_embeds(next_tokens_input)
@@ -290,7 +299,8 @@ def generate_for_geneval(
             continue
         prompt_text = meta["prompt"]
         prompt_dir = os.path.join(output_dir, f"{global_idx:05d}")
-        os.makedirs(prompt_dir, exist_ok=True)
+        samples_dir = os.path.join(prompt_dir, "samples")
+        os.makedirs(samples_dir, exist_ok=True)
 
         # 保存 metadata（GenEval evaluate.py 需要读这个）
         meta_out_path = os.path.join(prompt_dir, "metadata.jsonl")
@@ -301,7 +311,7 @@ def generate_for_geneval(
         formatted_prompt = encode_prompt(vl_chat_processor, prompt_text)
 
         for img_idx in range(num_images_per_prompt):
-            save_path = os.path.join(prompt_dir, f"samples_{img_idx}.jpg")
+            save_path = os.path.join(samples_dir, f"{img_idx}.jpg")
 
             # 断点续传：已有则跳过
             if os.path.exists(save_path):

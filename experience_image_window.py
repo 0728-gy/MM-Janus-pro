@@ -45,7 +45,8 @@ def generate_image_with_tts(
     image_token_num_per_image: int = 576,
     d: int = 8,           # 窗口大小
     sigma: float = 8.0,   # 熵阈值 (根据图像生成的分布可能需要调整，建议 2.0-5.0)
-    beam_size: int = 3    # Beam Search 宽度
+    beam_size: int = 3,    # Beam Search 宽度
+    temperature: float = 0.95
 ):
     # ==========================
     # 1. 初始化与预热 (Prefill)
@@ -92,14 +93,15 @@ def generate_image_with_tts(
     t_slow = 0
 
     print(f"Start generating {image_token_num_per_image} tokens...")
-
+    
+    history_hidden_states.append(last_hidden_state)
     # ==========================
     # 3. 主生成循环
     # ==========================
     while len(generated_tokens) < image_token_num_per_image:
         
         # 保存当前用于生成的 hidden_state (对应 step t 的输入状态)
-        history_hidden_states.append(last_hidden_state)
+        
 
         # ----------------------
         # A. 预测下一个 Token
@@ -113,8 +115,8 @@ def generate_image_with_tts(
         final_logits = logit_uncond + cfg_weight * (logit_cond - logit_uncond) # [vocab_size]
         
         # 计算概率与熵
-        probs = torch.softmax(final_logits / 0.95, dim=-1) # temp=1.0 usually for sampling
-        log_probs = torch.log_softmax(final_logits / 1.0, dim=-1)
+        probs = torch.softmax(final_logits / temperature, dim=-1) # temp=1.0 usually for sampling
+        log_probs = torch.log_softmax(final_logits / temperature, dim=-1)
         entropy = -torch.sum(probs * log_probs, dim=-1).item()
         
         # 采样 (通常图像生成需要一定的随机性，这里用 Multinomial)
@@ -144,6 +146,7 @@ def generate_image_with_tts(
         
         # 更新 last_hidden_state
         last_hidden_state = outputs.last_hidden_state[:, -1, :]
+        history_hidden_states.append(last_hidden_state)
         
         # 指针移动
         t_fast += 1
@@ -237,7 +240,17 @@ def generate_image_with_tts(
                     for b_idx in beam_indices:
                         cache_indices.append(2 * b_idx)
                         cache_indices.append(2 * b_idx + 1)
-                    past_key_values.reorder_cache(torch.tensor(cache_indices, device=_device))
+
+                    # 转成 tensor
+                    cache_indices_tensor = torch.tensor(cache_indices, dtype=torch.long, device=_device)
+
+                    # ------------------------------------------------------------------
+                    # ✅ 修复 Bug 2：同步重排历史隐状态，防止路径交叉产生缝合怪！
+                    for i in range(len(beam_history_hiddens)):
+                        beam_history_hiddens[i] = beam_history_hiddens[i][cache_indices_tensor]
+
+                    
+                    past_key_values.reorder_cache(cache_indices_tensor)
 
                     # 计算 Image Embedding 进行下一步 Forward
                     # token_indices: [k]

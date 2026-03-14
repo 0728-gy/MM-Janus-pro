@@ -24,7 +24,7 @@ from janus.models import MultiModalityCausalLM, VLChatProcessor
 from janus.utils.io import load_pil_images
 
 # specify the path to the model
-model_path = "deepseek-ai/Janus-1.3B"
+model_path = "/scratch/gongzx/models/Janus-Pro-7B"
 vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained(model_path)
 tokenizer = vl_chat_processor.tokenizer
 
@@ -35,11 +35,11 @@ vl_gpt = vl_gpt.to(torch.bfloat16).cuda().eval()
 
 conversation = [
     {
-        "role": "User",
+        "role": "<|User|>",
         "content": "<image_placeholder>\nConvert the formula into latex code.",
-        "images": ["images/equation.png"],
+        "images": ["/home/gongzx/share/MM2026/Janus/MM-Janus-pro/images/equation.png"],
     },
-    {"role": "Assistant", "content": ""},
+    {"role": "<|Assistant|>", "content": ""},
 ]
 
 # load images and prepare for inputs
