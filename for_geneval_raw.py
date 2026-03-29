@@ -43,7 +43,7 @@ def main():
 
     @torch.inference_mode()
     def generate(mmgpt, vl_chat_processor, prompt,
-                 temperature=0.95, parallel_size=4, cfg_weight=10.0,
+                 temperature=0.95, parallel_size=4, cfg_weight=5.0,
                  image_token_num_per_image=576, img_size=384, patch_size=16):
         
         input_ids = vl_chat_processor.tokenizer.encode(prompt)

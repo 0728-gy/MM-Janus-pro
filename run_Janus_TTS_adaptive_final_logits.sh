@@ -7,15 +7,20 @@
 #SBATCH -p compute_full_node
 #SBATCH --cpus-per-task=8
 #SBATCH --time=3:00:00
-#SBATCH --output=/scratch/gongzx/MM2026/geneval_results/SLURM-%j.out  # 修改了拼写 SLUM -> SLURM-
+#SBATCH --output=/scratch/gongzx/MM2026/geneval_results_adaptive/SLURM-%j.out
 
 # ================= 1. 统一变量配置 =================
-SIGMA_SUM=46
-D=6
-SIGMA_SINGLE=3.5
-MODEL_SUM=1
-MODEL_SINGLE=0
-RES_DIR="/scratch/gongzx/MM2026/geneval_results_new_entropy/janus_pro_7b_sigma_sum_${SIGMA_SUM}_d_${D}_sigma_sin${SIGMA_SINGLE}_mode_su${MODEL_SUM}_sin${MODEL_SINGLE}"
+BASELINE_WINDOW=16
+K_JUMP=1.6
+K_MEAN=1.6
+JUMP_FLOOR=1.5
+MEAN_FLOOR=3.0
+MIN_WINDOW=3
+MAX_WINDOW=12
+BEAM_SIZE=3
+CFG_WEIGHT=5.0
+
+RES_DIR="/scratch/gongzx/MM2026/geneval_results_adaptive_final_logits/janus_pro_7b_adaptive_kj${K_JUMP}_km${K_MEAN}_min${MIN_WINDOW}_max${MAX_WINDOW}"
 MODEL_PATH="/scratch/gongzx/MM2026/Janus-Pro-7B"
 METADATA_PATH="/home/gongzx/share/MM2026/Janus/geneval/prompts/evaluation_metadata.jsonl"
 # ===============================================================
@@ -34,23 +39,25 @@ export PYTHONUNBUFFERED=1
 
 mkdir -p $RES_DIR
 
-
 cd /home/gongzx/share/MM2026/Janus/MM-Janus-pro/
 
-# 【修复】：去掉了 --model_sum 这一行末尾的 \
-torchrun --nproc_per_node=4 for_geneval.py \
+torchrun --nproc_per_node=4 /home/gongzx/share/MM2026/Janus/MM-Janus-pro/for_geneval_final_logits.py\
     --model_path $MODEL_PATH \
     --metadata_path $METADATA_PATH \
     --output_dir $RES_DIR \
-    --sigma_sum $SIGMA_SUM \
-    -d $D \
-    --sigma_single $SIGMA_SINGLE \
-    --model_single $MODEL_SINGLE \
-    --model_sum $MODEL_SUM
+    --cfg_weight $CFG_WEIGHT \
+    --baseline_window $BASELINE_WINDOW \
+    --k_jump $K_JUMP \
+    --k_mean $K_MEAN \
+    --jump_floor $JUMP_FLOOR \
+    --mean_floor $MEAN_FLOOR \
+    --min_window_size $MIN_WINDOW \
+    --max_window_size $MAX_WINDOW \
+    --beam_size $BEAM_SIZE
 
 deactivate
 
-# 4. 环境切换 (评估任务)
+# 2. 环境切换 (评估任务)
 module purge
 module load StdEnv/2023 gcc/12.3 cuda/12.2 opencv scipy-stack python/3.11
 source /home/gongzx/share/MM2026/Janus/Infinity/bin/activate

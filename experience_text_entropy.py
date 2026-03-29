@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 # 1. 模型加载 (沿用你的代码)
-model_path = "/share/home/u11154/JingyiLiu/MM2026/Janus/model_weights/Janus-Pro-1B" # 或者 Janus-Pro-7B
+model_path = "/scratch/gongzx/models/Janus-Pro-7B" # 或者 Janus-Pro-7B
 vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained(model_path)
 tokenizer = vl_chat_processor.tokenizer
 
@@ -20,7 +20,7 @@ conversation = [
     {
         "role": "User",
         "content": "<image_placeholder>\nTo describe this image with details",
-        "images": ["/share/home/u11154/JingyiLiu/MM2026/Janus/images/funny-little-kitten-looks-around-260nw-2512772793.webp"],
+        "images": ["/home/gongzx/share/MM2026/Janus/MM-Janus-pro/images/1-eGmv5NFHx85_tnZwKdfM25SUjsz1DU0llkU9JZZFM.jpg"],
     },
     {"role": "Assistant", "content": ""},
 ]
@@ -64,6 +64,7 @@ def generate_text_with_entropy(
     generated_tokens = []
     all_hidden_states = []
     all_entropies = [] # 存储每一步的熵
+    all_V = []
     
     # 当前步的输入 Embedding (初始为整个 Prompt 拼接后的结果)
     current_inputs_embeds = inputs_embeds
@@ -91,10 +92,14 @@ def generate_text_with_entropy(
 
         # ---- [新增] 计算熵的逻辑 ----
         # 1. 转化为概率 (batch, vocab_size)
-        probs = torch.softmax(logits, dim=-1)
-        # 2. 计算熵 H = -sum(p * log(p))，加 1e-12 防止 log(0)
-        entropy = -torch.sum(probs * torch.log(probs + 1e-12), dim=-1)
-        all_entropies.append(entropy.item())
+        probs    = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy  = -torch.sum(probs * log_probs, dim=-1).item()
+        V = torch.sum(probs * ((-log_probs - entropy)**2), dim=-1).item()
+
+        tci = entropy / (V + 1e-4) 
+        all_entropies.append(entropy)
+        all_V.append(V)
 
         # ----------------------------
         # 贪心搜索 (Greedy Search)
@@ -123,7 +128,7 @@ def generate_text_with_entropy(
 
     
 
-    return generated_tokens, all_hidden_states, all_entropies
+    return generated_tokens, all_hidden_states, all_entropies, all_V
 
 
 # -----------------------------------------------------------
@@ -132,54 +137,55 @@ def generate_text_with_entropy(
 
  
 # 1. 调用修改后的函数
-tokens, hiddens, entropies = generate_text_with_entropy(
-     vl_gpt=vl_gpt,
-     tokenizer=tokenizer,
-     inputs_embeds=inputs_embeds,
-     attention_mask=prepare_inputs.attention_mask,
-     max_new_tokens=512
- )
+tokens, hiddens, entropies, V_list = generate_text_with_entropy(
+    vl_gpt=vl_gpt,
+    tokenizer=tokenizer,
+    inputs_embeds=inputs_embeds,
+    attention_mask=prepare_inputs.attention_mask,
+    max_new_tokens=512
+)
 
-# 2. 逐个 decode token，用于 X 轴标签
-# 注意：一定要逐个 decode 才能和熵的数量对齐
-token_labels = [tokenizer.decode([t]) for t in tokens]
-
-# 3. 打印检查
 answer = tokenizer.decode(tokens, skip_special_tokens=True)
 print(f"生成内容: {answer}")
 
+# 计算 TCI
+tci_list = [e / (v + 1e-4) for e, v in zip(entropies, V_list)]
 
-def plot_entropy_sequence(labels, entropies):
-    # 设置一个较大的画布，防止标签堆叠
-    plt.figure(figsize=(max(15, len(labels) * 0.3), 6)) 
-    
-    # 绘图
-    plt.plot(entropies, marker='o', linestyle='-', color='teal', markersize=4)
-    
-    # 处理标签：替换掉可能导致字体报错的特殊字符
-    # 很多 tokenizer 使用 ' ' (Unicode 9601) 表示空格，它会导致你看到的 Glyph 错误
-    # 修改这一段
-    clean_labels = []
-    for l in labels:
-        l = l.replace('\n', '\\n')
-        # 直接删掉特殊空格符
-        l = l.replace(' ', '') 
-        clean_labels.append(l)
+# 清理 token 标签
+token_labels = [tokenizer.decode([t]) for t in tokens]
+clean_labels = []
+for l in token_labels:
+    l = l.replace('\n', '\\n').replace(' ', '')
+    clean_labels.append(l)
 
-    plt.xticks(range(len(clean_labels)), clean_labels, rotation=45, ha='right', fontsize=8)
-    
-    plt.xlabel("Generated Tokens")
-    plt.ylabel("Entropy (Uncertainty)")
-    plt.title("Token Entropy during Generation")
-    plt.grid(True, axis='y', alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # --- 关键修改：保存图片 ---
-    save_path = "entropy_plot_2.png"
-    plt.savefig(save_path, dpi=300) 
-    print(f"图表已保存至: {save_path}")
-    # -----------------------
+x = range(len(tokens))
 
-# 调用绘图
-plot_entropy_sequence(token_labels, entropies)
+fig, axes = plt.subplots(3, 1, figsize=(max(15, len(tokens) * 0.3), 12), sharex=True)
+
+# 子图1：Entropy
+axes[0].plot(x, entropies, color='teal', linewidth=1.2, marker='o', markersize=3)
+axes[0].set_ylabel("Entropy")
+axes[0].set_title("Token Entropy")
+axes[0].grid(True, axis='y', alpha=0.3)
+
+# 子图2：V (H)
+axes[1].plot(x, V_list, color='steelblue', linewidth=1.2, marker='o', markersize=3)
+axes[1].set_ylabel("H (Variance)")
+axes[1].set_title("Token Variance H")
+axes[1].grid(True, axis='y', alpha=0.3)
+
+# 子图3：TCI
+axes[2].plot(x, tci_list, color='darkorange', linewidth=1.2, marker='o', markersize=3)
+axes[2].set_ylabel("TCI")
+axes[2].set_title("TCI (Entropy / H)")
+axes[2].grid(True, axis='y', alpha=0.3)
+
+# 共享 x 轴标签，只在最下面显示 token
+axes[2].set_xticks(x)
+axes[2].set_xticklabels(clean_labels, rotation=45, ha='right', fontsize=8)
+axes[2].set_xlabel("Generated Tokens")
+
+plt.suptitle("Generation Analysis", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig("/scratch/gongzx/ex_image/analysis_plot.png", dpi=300)
+print("图表已保存至: /scratch/gongzx/ex_image/analysis_plot.png")

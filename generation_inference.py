@@ -58,7 +58,7 @@ def generate(
     prompt: str,
     temperature: float = 0.95,
     parallel_size: int = 16,
-    cfg_weight: float = 10,
+    cfg_weight: float = 5,
     image_token_num_per_image: int = 576,
     img_size: int = 384,
     patch_size: int = 16,

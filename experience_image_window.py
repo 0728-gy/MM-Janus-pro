@@ -9,7 +9,7 @@ import PIL.Image
 from transformers import DynamicCache
 
 # specify the path to the model
-model_path = "/share/home/u11154/JingyiLiu/MM2026/Janus/model_weights/Janus-Pro-7B"
+model_path = "/scratch/gongzx/MM2026/Janus-Pro-7B"
 vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained(model_path)
 tokenizer = vl_chat_processor.tokenizer
 
@@ -41,7 +41,7 @@ def generate_image_with_tts(
     mmgpt: MultiModalityCausalLM,
     vl_chat_processor: VLChatProcessor,
     prompt: str,
-    cfg_weight: float = 9.0,
+    cfg_weight: float = 5,
     image_token_num_per_image: int = 576,
     d: int = 8,           # 窗口大小
     sigma: float = 8.0,   # 熵阈值 (根据图像生成的分布可能需要调整，建议 2.0-5.0)
@@ -84,6 +84,8 @@ def generate_image_with_tts(
     # ==========================
     generated_tokens = []    # 存储生成的 token id
     token_entropies = []     # 存储熵
+    token_scis = []      # ← 新增
+    token_cfg_gaps = []  # ← 新增
     
     # 存储历史的 hidden_states，用于回溯时恢复现场
     # 列表元素 shape: [2, hidden_dim]
@@ -116,8 +118,10 @@ def generate_image_with_tts(
         
         # 计算概率与熵
         probs = torch.softmax(final_logits / temperature, dim=-1) # temp=1.0 usually for sampling
-        log_probs = torch.log_softmax(final_logits / temperature, dim=-1)
-        entropy = -torch.sum(probs * log_probs, dim=-1).item()
+        probs_for_e = torch.softmax(logit_cond / temperature, dim=-1) 
+        log_probs = torch.log_softmax(logit_cond / temperature, dim=-1)
+        entropy = -torch.sum(probs_for_e * log_probs, dim=-1).item()
+       
         
         # 采样 (通常图像生成需要一定的随机性，这里用 Multinomial)
         next_token = torch.multinomial(probs, num_samples=1) # [1]
@@ -125,7 +129,6 @@ def generate_image_with_tts(
         # 临时存储结果
         generated_tokens.append(next_token.item())
         token_entropies.append(entropy)
-
         # ----------------------
         # C. 正常推进 (无回溯)
         # ----------------------
@@ -162,12 +165,12 @@ def generate_image_with_tts(
         trigger_backtrack = False
         if t_fast - t_slow == d:
             current_window_entropy = sum(token_entropies[-d:])
-            if current_window_entropy > sigma and len(generated_tokens)>d:
+            if   current_window_entropy > sigma and len(generated_tokens)>d:
                 trigger_backtrack = True
                 print(f"在第{len(generated_tokens)}个token回溯")
         
         if trigger_backtrack:
-            print(f"Token {len(generated_tokens)}: 触发回溯 (Entropy Sum: {current_window_entropy:.2f})")
+            print(f"Token {len(generated_tokens)}: 触发回溯 (Entropy Sum: { current_window_entropy:.2f})")
 
             # ✅ 问题4：边界保护
             if len(history_hidden_states) <= d:
@@ -177,6 +180,8 @@ def generate_image_with_tts(
                 # --- 1. 回溯状态 ---
                 generated_tokens = generated_tokens[:-d]
                 token_entropies = token_entropies[:-d]
+                token_scis = token_scis[:-d]          # ← 补上
+                token_cfg_gaps = token_cfg_gaps[:-d]  # ← 补上
 
                 # ✅ 问题2：crop 用绝对长度
                 current_len = past_key_values.get_seq_length()
@@ -274,6 +279,8 @@ def generate_image_with_tts(
                 winner_tokens = beam_seqs[best_idx].tolist()
                 generated_tokens.extend(winner_tokens)
                 token_entropies.extend([0.0] * d)
+                token_scis.extend([0.0] * d)        # ← 补上
+                token_cfg_gaps.extend([0.0] * d) 
 
                 winner_cache = DynamicCache()
                 for layer_idx in range(len(past_key_values)):
@@ -330,8 +337,8 @@ def expand_cache_for_beam(past_key_values, beam_size):
     return new_cache
 
 # 调用示例
-img_array = generate_image_with_tts(vl_gpt, vl_chat_processor, prompt, sigma=15.0)
-PIL.Image.fromarray(img_array).save("result_6.jpg")
+img_array = generate_image_with_tts(vl_gpt, vl_chat_processor, prompt, sigma=45.0)
+PIL.Image.fromarray(img_array).save("/scratch/gongzx/MM2026/ex_image/result_for_base_entropy.jpg")
 
 
 

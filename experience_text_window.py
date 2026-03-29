@@ -35,6 +35,9 @@ def generate_text(
     inputs_embeds: torch.Tensor,
     attention_mask: torch.Tensor,
     sigma: float,
+    sigma_single :float,
+    model_sum: int=1,
+    model_single: int=0,
     max_new_tokens: int = 512,
     d: int = 4,
     beam_size: int = 4,
@@ -91,6 +94,10 @@ def generate_text(
         probs    = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
         entropy  = -torch.sum(probs * log_probs, dim=-1).item()
+        
+
+        
+
         token_entropies.append(entropy)
 
         next_token = torch.argmax(logits, dim=-1)  # [1]  贪心解码
@@ -127,11 +134,21 @@ def generate_text(
 
         trigger_backtrack = False
         if t_fast - t_slow == d:
-            window_entropy = sum(token_entropies[-d:])
-            if window_entropy > sigma and len(generated_tokens) > d:
-                trigger_backtrack = True
-                print(f"Token {len(generated_tokens)}: 触发回溯 (窗口熵={window_entropy:.2f})")
+            current_window_entropy = sum(token_entropies[-d:])
 
+            if current_window_entropy > sigma and len(generated_tokens)>d and model_sum ==1:
+                trigger_backtrack = True
+                print(f"在第{len(generated_tokens)}个token回溯")
+            
+            count_num =0
+            for i in token_entropies[-d:]:
+                if i > sigma_single:
+                    count_num+=1
+                    
+                
+                if  len(generated_tokens)>d and model_single==1 and count_num ==d:
+                    trigger_backtrack =True
+                    print(f"在第{len(generated_tokens)}个token回溯")
         if not trigger_backtrack:
             continue  # 无需回溯，直接进行下一步
 

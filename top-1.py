@@ -5,6 +5,7 @@ from janus.models import MultiModalityCausalLM, VLChatProcessor
 import numpy as np
 import torch.nn.functional as F
 import PIL.Image
+import math
 
 from transformers import DynamicCache
 
@@ -17,8 +18,9 @@ LOCAL_RANK = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_PROCID", 0))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", 1)))
 torch.cuda.set_device(LOCAL_RANK)
 DEVICE = f"cuda:{LOCAL_RANK}"
+
 # ============================================================
-# 核心生成函数（不变，保留 TTS 逻辑）
+# 核心生成函数（自适应窗口 + Beam Search 回溯）
 # ============================================================
 
 def expand_cache_for_beam(past_key_values, beam_size):
@@ -38,32 +40,25 @@ def generate_single_image(
     prompt: str,
     cfg_weight: float = 5.0,
     image_token_num_per_image: int = 576,
-    d: int = 8,
-    sigma_sum: float = 35.0,        # [修复] 补齐缺失的参数
-    sigma_single: float = 0.0,      # [修复] 补齐缺失的参数
-    model_sum: int = 1,             # [修复] 补齐缺失的参数
-    model_single: int = 0,  
+    baseline_window: int = 16,
+    k_jump: float = 1.0,
+    k_mean: float = 1.0,
+    jump_floor: float = 1.5,
+    mean_floor: float = 3.0,
+    min_window_size: int = 3,
+    max_window_size: int = 12,
     beam_size: int = 3,
-    temperature:float =0.95
+    temperature: float = 0.95,
 ) -> np.ndarray:
-    """
-    对单个 prompt 生成一张图，返回 np.ndarray (H, W, 3) uint8。
-    """
     _device = next(mmgpt.parameters()).device
 
     input_ids = vl_chat_processor.tokenizer.encode(prompt)
     input_ids = torch.LongTensor(input_ids).to(_device)
 
     tokens = torch.stack([input_ids.clone(), input_ids.clone()], dim=0)
-    
-    # 2. 对 Unconditional 分支 (索引为 1) 进行处理：
-    # 保留第一个 Token (BOS) 和最后一个 Token (Image Start Tag)，
-    # 将中间的所有描述性文字替换为 pad_id。
-    tokens[1, 1:-1] = vl_chat_processor.pad_id 
-    
-    # 3. 将 Token 转换为 Embedding
-    inputs_embeds = mmgpt.language_model.get_input_embeddings()(tokens)
+    tokens[1, 1:-1] = vl_chat_processor.pad_id
 
+    inputs_embeds = mmgpt.language_model.get_input_embeddings()(tokens)
     outputs = mmgpt.language_model.model(
         inputs_embeds=inputs_embeds, use_cache=True, past_key_values=None
     )
@@ -72,32 +67,40 @@ def generate_single_image(
 
     generated_tokens = []
     token_entropies = []
-    history_hidden_states = []
-    history_hidden_states.append(last_hidden_state)
+    delta_entropies = []
+    history_hidden_states = [last_hidden_state]
 
     t_fast = 0
     t_slow = 0
 
     while len(generated_tokens) < image_token_num_per_image:
 
-
+        # ----------------------
+        # A. 预测下一个 Token
+        # ----------------------
         logits = mmgpt.gen_head(last_hidden_state)
-        logit_cond = logits[0, :]
+        logit_cond   = logits[0, :]
         logit_uncond = logits[1, :]
         final_logits = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
 
-        probs = torch.softmax(final_logits/temperature, dim=-1)
-        probs_for_e = torch.softmax(logit_cond / temperature, dim=-1) 
-        log_probs = torch.log_softmax(  logit_cond/ temperature, dim=-1)
-        entropy = -torch.sum(probs_for_e * log_probs, dim=-1).item()
+        probs       = torch.softmax(final_logits / temperature, dim=-1)
+        probs_for_e = torch.softmax(logit_cond/ temperature, dim=-1)
+        log_probs   = torch.log_softmax(logit_cond / temperature, dim=-1)
+        entropy     = -torch.sum(probs_for_e * log_probs, dim=-1).item()
 
-        next_token = torch.multinomial(probs, num_samples=1)
+        _,next_token = torch.topk(probs, 1)
 
         generated_tokens.append(next_token.item())
         token_entropies.append(entropy)
+        t_fast = len(generated_tokens)
 
+        delta_entropies.append(0.0 if t_fast == 1 else abs(token_entropies[-1] - token_entropies[-2]))
+
+        # ----------------------
+        # B. 更新 KV cache
+        # ----------------------
         next_token_input = next_token.repeat(2)
-        img_embeds = mmgpt.prepare_gen_img_embeds(next_token_input)
+        img_embeds    = mmgpt.prepare_gen_img_embeds(next_token_input)
         inputs_embeds = img_embeds.unsqueeze(1)
 
         outputs = mmgpt.language_model.model(
@@ -108,131 +111,157 @@ def generate_single_image(
         last_hidden_state = outputs.last_hidden_state[:, -1, :]
         history_hidden_states.append(last_hidden_state)
 
-        t_fast += 1
-        t_slow += 1
+        window_size = t_fast - t_slow
 
-        if t_fast - t_slow < d:
-            t_slow -= 1
-            
+        # ----------------------
+        # C. 预热期：slow 跟着 fast 走
+        # ----------------------
+        if t_fast <= baseline_window:
+            t_slow = t_fast
+            continue
+
+        # ----------------------
+        # D. 计算自适应阈值
+        # ----------------------
+        base_start  = max(0, t_slow - baseline_window)
+        base_ents   = token_entropies[base_start : t_slow]
+        base_deltas = delta_entropies[base_start : t_slow]
+
+        base_ent_mean   = sum(base_ents) / len(base_ents)
+        base_ent_std    = math.sqrt(sum((x - base_ent_mean) ** 2 for x in base_ents) / len(base_ents))
+        base_delta_mean = sum(base_deltas) / len(base_deltas)
+        base_delta_std  = math.sqrt(sum((x - base_delta_mean) ** 2 for x in base_deltas) / len(base_deltas))
+
+        jump_threshold = max(jump_floor, base_delta_mean + k_jump * base_delta_std)
+        mean_threshold = max(mean_floor, base_ent_mean   + k_mean * base_ent_std)
+        jump_threshold = min(jump_threshold, 5.0)
+        mean_threshold = min(mean_threshold, 8.0)
+
+        current_delta  = delta_entropies[-1]
+        avg_window_ent = sum(token_entropies[t_slow:t_fast]) / window_size
+
+        # ----------------------
+        # E. 触发判断
+        # ----------------------
         trigger_backtrack = False
+        d = 0
 
-        
-        if t_fast - t_slow == d:
-            current_window_entropy = sum(token_entropies[-d:])
+        spike_trigger = (current_delta > jump_threshold and window_size >= min_window_size)
+        cap_trigger   = (window_size >= max_window_size)
 
-            if current_window_entropy > sigma_sum and len(generated_tokens)>d and model_sum ==1:
-                trigger_backtrack = True
-                print(f"在第{len(generated_tokens)}个token回溯")
-            
-            count_num =0
-            for i in token_entropies[-d:]:
-                if i > sigma_single:
-                    count_num+=1
-                    
-                
-                if  len(generated_tokens)>d and model_single==1 and count_num ==d:
-                    trigger_backtrack =True
-                    print(f"在第{len(generated_tokens)}个token回溯")
+        if (spike_trigger or cap_trigger) and avg_window_ent > mean_threshold:
+            trigger_backtrack = True
+            d = window_size
+            reason = "熵突变" if spike_trigger else "窗口上限"
+            print(f"Token {t_fast}: 触发回溯! ({reason}, 窗口: {window_size}, "
+                  f"均值ent: {avg_window_ent:.2f} > {mean_threshold:.2f})")
+        elif spike_trigger and avg_window_ent <= mean_threshold:
+            t_slow = t_fast  # 假警报，安全提交
+        elif cap_trigger and avg_window_ent <= mean_threshold:
+            t_slow = t_fast  # 到上限且质量OK，强制提交
 
+        # ----------------------
+        # F. 回溯 + Beam Search
+        # ----------------------
         if trigger_backtrack:
             if len(history_hidden_states) <= d:
-                pass  # 历史不足，跳过回溯
+                print("警告：历史不足，跳过回溯")
             else:
                 generated_tokens = generated_tokens[:-d]
-                token_entropies = token_entropies[:-d]
+                token_entropies  = token_entropies[:-d]
+                delta_entropies  = delta_entropies[:-d]
+
+                t_fast = len(generated_tokens)
 
                 current_len = past_key_values.get_seq_length()
                 past_key_values.crop(current_len - d)
-
                 history_hidden_states = history_hidden_states[:-d]
-                start_hidden_state = history_hidden_states[-1]
+                start_hidden_state    = history_hidden_states[-1]
 
                 beam_hidden_state = start_hidden_state.repeat(beam_size, 1)
-                past_key_values = expand_cache_for_beam(past_key_values, beam_size)
+                past_key_values   = expand_cache_for_beam(past_key_values, beam_size)
 
                 beam_scores = torch.full((beam_size,), -1e9, device=_device)
-                beam_scores[0] = 0.0 
-                beam_seqs = torch.zeros(
-                    (beam_size, 0), dtype=torch.long, device=_device
-                )
+                beam_scores[0] = 0.0
+                beam_seqs   = torch.zeros((beam_size, 0), dtype=torch.long, device=_device)
                 beam_history_hiddens = [beam_hidden_state]
+                beam_entropies = []
 
                 for step in range(d):
                     curr_h = beam_history_hiddens[-1]
                     b_logits = mmgpt.gen_head(curr_h)
 
-                    b_logits_view = b_logits.view(beam_size, 2, -1)
-                    b_cond = b_logits_view[:, 0, :]
-                    b_uncond = b_logits_view[:, 1, :]
+                    b_logits_view  = b_logits.view(beam_size, 2, -1)
+                    b_cond         = b_logits_view[:, 0, :]
+                    b_uncond       = b_logits_view[:, 1, :]
                     b_final_logits = b_uncond + cfg_weight * (b_cond - b_uncond)
 
-                    b_log_probs = F.log_softmax(b_final_logits, dim=-1)
+                    b_probs_for_e = torch.softmax(b_cond / temperature, dim=-1)
+                    b_log_probs_e = torch.log_softmax(b_cond / temperature, dim=-1)
+                    b_entropies_step = -torch.sum(b_probs_for_e * b_log_probs_e, dim=-1)
 
-                    next_scores = beam_scores.unsqueeze(1) + b_log_probs
+                    b_log_probs      = F.log_softmax(b_final_logits / temperature, dim=-1)
+                    next_scores      = beam_scores.unsqueeze(1) + b_log_probs
                     next_scores_flat = next_scores.view(-1)
 
                     topk_scores, topk_indices = torch.topk(next_scores_flat, beam_size)
-                    beam_indices = topk_indices // b_final_logits.shape[-1]
-                    token_indices = topk_indices % b_final_logits.shape[-1]
+                    beam_indices  = topk_indices // b_final_logits.shape[-1]
+                    token_indices = topk_indices %  b_final_logits.shape[-1]
+
+                    b_entropies_step = b_entropies_step[beam_indices]  # reorder 后再 append
+                    beam_entropies.append(b_entropies_step)
 
                     beam_scores = topk_scores
-                    beam_seqs = torch.cat(
-                        [beam_seqs[beam_indices], token_indices.unsqueeze(1)], dim=1
-                    )
+                    beam_seqs   = torch.cat([beam_seqs[beam_indices], token_indices.unsqueeze(1)], dim=1)
 
                     cache_indices = []
                     for b_idx in beam_indices:
                         cache_indices.append(2 * b_idx)
                         cache_indices.append(2 * b_idx + 1)
-
                     cache_indices_tensor = torch.tensor(cache_indices, dtype=torch.long, device=_device)
 
-                    # ------------------------------------------------------------------
-                    # ✅ 修复 Bug 2：同步重排历史隐状态，防止路径交叉产生缝合怪！
                     for i in range(len(beam_history_hiddens)):
                         beam_history_hiddens[i] = beam_history_hiddens[i][cache_indices_tensor]
-
-                    
                     past_key_values.reorder_cache(cache_indices_tensor)
 
                     next_tokens_input = token_indices.repeat_interleave(2)
-                    img_embeds = mmgpt.prepare_gen_img_embeds(next_tokens_input)
-                    img_embeds = img_embeds.unsqueeze(1)
+                    img_embeds = mmgpt.prepare_gen_img_embeds(next_tokens_input).unsqueeze(1)
 
                     b_outputs = mmgpt.language_model.model(
                         inputs_embeds=img_embeds,
                         use_cache=True,
                         past_key_values=past_key_values,
                     )
-
                     new_h = b_outputs.last_hidden_state[:, -1, :]
                     beam_history_hiddens.append(new_h)
 
-                best_idx = torch.argmax(beam_scores).item()
+                best_idx      = torch.argmax(beam_scores).item()
                 winner_tokens = beam_seqs[best_idx].tolist()
                 generated_tokens.extend(winner_tokens)
-                token_entropies.extend([0.0] * d)
+
+                # 用 winner beam 的真实熵填入
+                winner_entropies = [beam_entropies[step][best_idx].item() for step in range(d)]
+                token_entropies.extend(winner_entropies)
+                delta_entropies.extend(
+                    [0.0] + [abs(winner_entropies[i] - winner_entropies[i-1]) for i in range(1, d)]
+                )
 
                 winner_cache = DynamicCache()
                 for layer_idx in range(len(past_key_values)):
                     k, v = past_key_values[layer_idx]
                     winner_cache.update(
-                        k[2*best_idx : 2*best_idx+2], 
-                        v[2*best_idx : 2*best_idx+2], 
+                        k[2 * best_idx : 2 * best_idx + 2],
+                        v[2 * best_idx : 2 * best_idx + 2],
                         layer_idx
                     )
                 past_key_values = winner_cache
 
                 for bh in beam_history_hiddens[1:]:
-                    wh = bh[2 * best_idx : 2 * best_idx + 2, :]
-                    history_hidden_states.append(wh)
+                    history_hidden_states.append(bh[2 * best_idx : 2 * best_idx + 2, :])
 
                 last_hidden_state = history_hidden_states[-1]
-                t_slow = t_fast
+                t_slow = len(generated_tokens)
                 continue
-
-        # 正常推进
-        
 
     # 解码
     gen_ids = torch.tensor(generated_tokens, dtype=torch.int).unsqueeze(0).to(_device)
@@ -250,7 +279,6 @@ def generate_single_image(
 # ============================================================
 
 def encode_prompt(vl_chat_processor: VLChatProcessor, text: str) -> str:
-    """将文本 prompt 转为模型输入字符串（含 image_start_tag）。"""
     conversation = [
         {"role": "User", "content": text},
         {"role": "Assistant", "content": ""},
@@ -270,38 +298,24 @@ def encode_prompt(vl_chat_processor: VLChatProcessor, text: str) -> str:
 def generate_for_geneval(
     mmgpt: MultiModalityCausalLM,
     vl_chat_processor: VLChatProcessor,
-    metadata_path: str,       # GenEval metadata JSONL 文件路径
-    output_dir: str,          # 输出根目录
-    num_images_per_prompt: int = 4,   # 每个 prompt 生成几张图
+    metadata_path: str,
+    output_dir: str,
+    num_images_per_prompt: int = 4,
     cfg_weight: float = 10.0,
     image_token_num_per_image: int = 576,
-    d: int = 8,
-    sigma_sum: float = 15.0,       # [修复] 补齐参数
-    sigma_single: float = 0.0,     # [修复] 补齐参数
-    model_sum: int = 1,            # [修复] 补齐参数
-    model_single: int = 0,  
+    baseline_window: int = 16,
+    k_jump: float = 1.0,
+    k_mean: float = 1.0,
+    jump_floor: float = 1.5,
+    mean_floor: float = 3.0,
+    min_window_size: int = 3,
+    max_window_size: int = 12,
     beam_size: int = 3,
-    start_idx: int = 0,       # 断点续传：从第几个 prompt 开始
+    temperature: float = 0.95,
+    start_idx: int = 0,
 ):
-    """
-    读取 GenEval metadata JSONL，批量生成图像。
-
-    输出目录结构（与 GenEval evaluate.py 兼容）：
-        output_dir/
-          00000/
-            samples_0.jpg
-            samples_1.jpg
-            ...
-            metadata.jsonl   ← 每个子目录复制一份 metadata 方便 eval
-          00001/
-            ...
-
-    metadata JSONL 每行格式示例：
-        {"prompt": "a cat sitting on a mat", "category": "single_object", ...}
-    """
     os.makedirs(output_dir, exist_ok=True)
 
-    # 读取所有 prompts
     prompts = []
     with open(metadata_path, "r") as f:
         for line in f:
@@ -318,23 +332,21 @@ def generate_for_geneval(
             continue
         if global_idx % WORLD_SIZE != LOCAL_RANK:
             continue
+
         prompt_text = meta["prompt"]
-        prompt_dir = os.path.join(output_dir, f"{global_idx:05d}")
+        prompt_dir  = os.path.join(output_dir, f"{global_idx:05d}")
         samples_dir = os.path.join(prompt_dir, "samples")
         os.makedirs(samples_dir, exist_ok=True)
 
-        # 保存 metadata（GenEval evaluate.py 需要读这个）
         meta_out_path = os.path.join(prompt_dir, "metadata.jsonl")
         with open(meta_out_path, "w") as mf:
             mf.write(json.dumps(meta) + "\n")
 
-        # 编码 prompt（只做一次）
         formatted_prompt = encode_prompt(vl_chat_processor, prompt_text)
 
         for img_idx in range(num_images_per_prompt):
             save_path = os.path.join(samples_dir, f"{img_idx}.jpg")
 
-            # 断点续传：已有则跳过
             if os.path.exists(save_path):
                 print(f"  Skip existing: {save_path}")
                 continue
@@ -347,12 +359,15 @@ def generate_for_geneval(
                 prompt=formatted_prompt,
                 cfg_weight=cfg_weight,
                 image_token_num_per_image=image_token_num_per_image,
-                d=d,          # [修复] 正确传参
-                sigma_single=sigma_single,     # [修复] 正确传参
-                model_sum=model_sum,           # [修复] 正确传参
-                model_single=model_single, 
-                sigma_sum=sigma_sum,
+                baseline_window=baseline_window,
+                k_jump=k_jump,
+                k_mean=k_mean,
+                jump_floor=jump_floor,
+                mean_floor=mean_floor,
+                min_window_size=min_window_size,
+                max_window_size=max_window_size,
                 beam_size=beam_size,
+                temperature=temperature,
             )
 
             PIL.Image.fromarray(img_array).save(save_path, quality=95)
@@ -365,31 +380,23 @@ def generate_for_geneval(
 # ============================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Janus-Pro GenEval Image Generation with TTS")
+    parser = argparse.ArgumentParser(description="Janus-Pro GenEval with Adaptive-Window Beam Refinement")
     parser.add_argument("--model_path", type=str,
-                        default="/share/home/u11154/JingyiLiu/MM2026/Janus_ex_data/model_weights/Janus-Pro-7B")
-    parser.add_argument("--metadata_path", type=str, required=True,
-                        help="/share/home/u11154/JingyiLiu/MM2026/geneval/prompts/evaluation_metadata.jsonl")
-    parser.add_argument("--output_dir", type=str, required=True,
-                        help="Root output directory")
-    parser.add_argument("--num_images_per_prompt", type=int, default=4,
-                        help="Number of images to generate per prompt")
-    parser.add_argument("--cfg_weight", type=float, default=9.0)
-    parser.add_argument("--sigma_sum", type=float, default=15.0,
-                        help="Entropy threshold for TTS backtracking")
-    parser.add_argument("-d", type=int, default=8,
-                        help="Window size for TTS")
-    parser.add_argument("--beam_size", type=int, default=3,
-                        help="Beam size for TTS backtracking")
-    parser.add_argument("--start_idx", type=int, default=0,
-                        help="Resume from this prompt index (for checkpoint restart)")
-    parser.add_argument("--sigma_single", type=float, default=0, 
-                        help="Resume from this prompt index (for checkpoint restart)")
-    parser.add_argument("--model_sum", type=int, default=1,
-                        help="Resume from this prompt index (for checkpoint restart)")
-    parser.add_argument("--model_single", type=int, default=0,
-                        help="Resume from this prompt index (for checkpoint restart)")
-    
+                        default="/scratch/gongzx/MM2026/Janus-Pro-7B")
+    parser.add_argument("--metadata_path", type=str, required=True)
+    parser.add_argument("--output_dir",    type=str, required=True)
+    parser.add_argument("--num_images_per_prompt", type=int, default=4)
+    parser.add_argument("--cfg_weight",    type=float, default=5.0)
+    parser.add_argument("--baseline_window", type=int, default=16)
+    parser.add_argument("--k_jump",        type=float, default=1.0)
+    parser.add_argument("--k_mean",        type=float, default=1.0)
+    parser.add_argument("--jump_floor",    type=float, default=1.5)
+    parser.add_argument("--mean_floor",    type=float, default=3.0)
+    parser.add_argument("--min_window_size", type=int, default=3)
+    parser.add_argument("--max_window_size", type=int, default=12)
+    parser.add_argument("--beam_size",     type=int,   default=3)
+    parser.add_argument("--temperature",   type=float, default=0.95)
+    parser.add_argument("--start_idx",     type=int,   default=0)
     return parser.parse_args()
 
 
@@ -400,7 +407,6 @@ if __name__ == "__main__":
         print(f"Loading model from: {args.model_path}")
 
     vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained(args.model_path)
-
     vl_gpt: MultiModalityCausalLM = AutoModelForCausalLM.from_pretrained(
         args.model_path, trust_remote_code=True
     )
@@ -416,12 +422,14 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         num_images_per_prompt=args.num_images_per_prompt,
         cfg_weight=args.cfg_weight,
-        image_token_num_per_image=576,
-        d=args.d,
-        sigma_sum=args.sigma_sum,         # [修复] 严格对应
-        sigma_single=args.sigma_single,   # [修复] 严格对应
-        model_sum=args.model_sum,         # [修复] 严格对应
-        model_single=args.model_single,  
+        baseline_window=args.baseline_window,
+        k_jump=args.k_jump,
+        k_mean=args.k_mean,
+        jump_floor=args.jump_floor,
+        mean_floor=args.mean_floor,
+        min_window_size=args.min_window_size,
+        max_window_size=args.max_window_size,
         beam_size=args.beam_size,
+        temperature=args.temperature,
         start_idx=args.start_idx,
     )
