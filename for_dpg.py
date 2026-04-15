@@ -13,6 +13,7 @@ import os
 import json
 import argparse
 from tqdm import tqdm
+import pandas as pd  # 新增 pandas 用于处理 DPG-Bench CSV
 
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_PROCID", 0)))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", 1)))
@@ -361,67 +362,61 @@ def encode_prompt(vl_chat_processor: VLChatProcessor, text: str) -> str:
 
 
 # ============================================================
-# GenEval 批量生成主函数
+# DPG-Bench 批量生成主函数 (已重写)
 # ============================================================
 
-def generate_for_geneval(
+def generate_for_dpg_bench(
     mmgpt: MultiModalityCausalLM,
     vl_chat_processor: VLChatProcessor,
-    metadata_path: str,
+    csv_path: str,
     output_dir: str,
-    num_images_per_prompt: int = 4,
-    cfg_weight: float = 10.0,
+    resolution: int = 384,  # Janus-Pro 576 tokens 默认输出是 384x384
+    pic_num: int = 4,       # 单个 Prompt 对应生成的图片数(如果>1，会拼图)
+    cfg_weight: float = 5.0,
     image_token_num_per_image: int = 576,
-    baseline_window: int = 16,
-    k_jump: float = 1.0,
-    k_mean: float = 1.0,
+    baseline_window: int = 8,
+    k_jump: float = 2.0,
+    k_mean: float = 2.0,
     jump_floor: float = 1.5,
     mean_floor: float = 3.0,
     min_window_size: int = 3,
-    max_window_size: int = 12,
+    max_window_size: int = 8,
     beam_size: int = 3,
     temperature: float = 0.95,
-    start_idx: int = 0,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
-    prompts = []
-    with open(metadata_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                prompts.append(json.loads(line))
+    # 读取 DPG-Bench CSV 并按 item_id 去重（每个 item_id 只生成一次图像，用于所有关联命题）
+    df = pd.read_csv(csv_path)
+    unique_prompts = df.groupby('item_id').first().reset_index()
+    items = unique_prompts[['item_id', 'text']].to_dict('records')
 
     if LOCAL_RANK == 0:
-        print(f"Total prompts: {len(prompts)}, generating {num_images_per_prompt} images each.")
-        print(f"Starting from index: {start_idx}")
+        print(f"Total unique DPG items: {len(items)}")
+        print(f"Generating {pic_num} sub-images per item, tiled into one file (Resolution: {resolution}x{resolution}).")
 
-    for global_idx, meta in enumerate(tqdm(prompts, desc="Prompts", disable=(LOCAL_RANK != 0))):
-        if global_idx < start_idx:
-            continue
-        if global_idx % WORLD_SIZE != LOCAL_RANK:
+    for idx, item in enumerate(tqdm(items, desc="Generating DPG Images", disable=(LOCAL_RANK != 0))):
+        if idx % WORLD_SIZE != LOCAL_RANK:
             continue
 
-        prompt_text = meta["prompt"]
-        prompt_dir  = os.path.join(output_dir, f"{global_idx:05d}")
-        samples_dir = os.path.join(prompt_dir, "samples")
-        os.makedirs(samples_dir, exist_ok=True)
+        item_id = str(item['item_id'])
+        prompt_text = item['text']
+        
+        # DPG-Bench 评测脚本要求：图像文件名不带后缀部分需完全等于 item_id
+        save_path = os.path.join(output_dir, f"{item_id}.png")
 
-        meta_out_path = os.path.join(prompt_dir, "metadata.jsonl")
-        with open(meta_out_path, "w") as mf:
-            mf.write(json.dumps(meta) + "\n")
+        if os.path.exists(save_path):
+            if LOCAL_RANK == 0:
+                print(f"  Skip existing: {save_path}")
+            continue
+
+        if LOCAL_RANK == 0:
+            print(f"  [{idx:05d}] Item_id: {item_id} | {prompt_text[:60]}...")
 
         formatted_prompt = encode_prompt(vl_chat_processor, prompt_text)
-
-        for img_idx in range(num_images_per_prompt):
-            save_path = os.path.join(samples_dir, f"{img_idx}.jpg")
-
-            if os.path.exists(save_path):
-                print(f"  Skip existing: {save_path}")
-                continue
-
-            print(f"  [{global_idx:05d}] Image {img_idx+1}/{num_images_per_prompt} | {prompt_text[:60]}...")
-
+        
+        sub_images = []
+        for i in range(pic_num):
             img_array = generate_single_image(
                 mmgpt=mmgpt,
                 vl_chat_processor=vl_chat_processor,
@@ -438,10 +433,33 @@ def generate_for_geneval(
                 beam_size=beam_size,
                 temperature=temperature,
             )
+            
+            # 缩放子图到指定的 resolution (用于对齐 DPG-bench 脚本中的 Crop Tuple 逻辑)
+            img = PIL.Image.fromarray(img_array).resize((resolution, resolution), PIL.Image.LANCZOS)
+            sub_images.append(img)
 
-            PIL.Image.fromarray(img_array).save(save_path, quality=95)
+        # 处理多图拼接 (Tile) 逻辑
+        if pic_num == 1:
+            final_image = sub_images[0]
+        else:
+            # 根据 DPG 评测脚本的 crop_tuples_list: (0,0), (res,0), (0,res), (res,res)
+            grid_w = resolution * 2 if pic_num > 1 else resolution
+            grid_h = resolution * 2 if pic_num > 2 else resolution
+            final_image = PIL.Image.new('RGB', (grid_w, grid_h))
+            
+            positions = [
+                (0, 0),                        # 图1: top-left
+                (resolution, 0),               # 图2: top-right
+                (0, resolution),               # 图3: bottom-left
+                (resolution, resolution)       # 图4: bottom-right
+            ]
+            for i in range(min(pic_num, len(positions))):
+                final_image.paste(sub_images[i], positions[i])
 
-    print(f"\nDone. Results saved to: {output_dir}")
+        final_image.save(save_path, quality=95)
+
+    if LOCAL_RANK == 0:
+        print(f"\nDone. Results saved to: {output_dir}")
 
 
 # ============================================================
@@ -449,23 +467,28 @@ def generate_for_geneval(
 # ============================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Janus-Pro GenEval with Adaptive-Window Beam Refinement")
-    parser.add_argument("--model_path", type=str,
-                        default="/scratch/gongzx/MM2026/Janus-Pro-7B")
-    parser.add_argument("--metadata_path", type=str, required=True)
-    parser.add_argument("--output_dir",    type=str, required=True)
-    parser.add_argument("--num_images_per_prompt", type=int, default=4)
-    parser.add_argument("--cfg_weight",    type=float, default=5.0)
-    parser.add_argument("--baseline_window", type=int, default=16)
-    parser.add_argument("--k_jump",        type=float, default=1.0)
-    parser.add_argument("--k_mean",        type=float, default=1.0)
-    parser.add_argument("--jump_floor",    type=float, default=1.5)
-    parser.add_argument("--mean_floor",    type=float, default=3.0)
+    parser = argparse.ArgumentParser(description="Janus-Pro DPG-Bench Gen with Adaptive-Window Beam Refinement")
+    parser.add_argument("--model_path", type=str, default="/scratch/gongzx/MM2026/Janus-Pro-7B")
+    
+    # 替换了原有的 --metadata_path，专门用于 DPG
+    parser.add_argument("--csv_path",   type=str, required=True, help="Path to dpg_bench.csv")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save generated images")
+    
+    # DPG 专有参数
+    parser.add_argument("--resolution", type=int, default=384, help="Resolution per generated sub-image")
+    parser.add_argument("--pic_num",    type=int, default=4,   help="Number of images to generate and tile per item_id")
+    
+    # 生成核心超参数保持不变
+    parser.add_argument("--cfg_weight",      type=float, default=5.0)
+    parser.add_argument("--baseline_window", type=int, default=8)
+    parser.add_argument("--k_jump",          type=float, default=2.0)
+    parser.add_argument("--k_mean",          type=float, default=2.0)
+    parser.add_argument("--jump_floor",      type=float, default=1.5)
+    parser.add_argument("--mean_floor",      type=float, default=3.0)
     parser.add_argument("--min_window_size", type=int, default=3)
-    parser.add_argument("--max_window_size", type=int, default=12)
-    parser.add_argument("--beam_size",     type=int,   default=3)
-    parser.add_argument("--temperature",   type=float, default=0.95)
-    parser.add_argument("--start_idx",     type=int,   default=0)
+    parser.add_argument("--max_window_size", type=int, default=8)
+    parser.add_argument("--beam_size",       type=int, default=3)
+    parser.add_argument("--temperature",     type=float, default=0.95)
     return parser.parse_args()
 
 
@@ -484,12 +507,13 @@ if __name__ == "__main__":
     if LOCAL_RANK == 0:
         print("Model loaded.")
 
-    generate_for_geneval(
+    generate_for_dpg_bench(
         mmgpt=vl_gpt,
         vl_chat_processor=vl_chat_processor,
-        metadata_path=args.metadata_path,
+        csv_path=args.csv_path,
         output_dir=args.output_dir,
-        num_images_per_prompt=args.num_images_per_prompt,
+        resolution=args.resolution,
+        pic_num=args.pic_num,
         cfg_weight=args.cfg_weight,
         baseline_window=args.baseline_window,
         k_jump=args.k_jump,
@@ -500,5 +524,4 @@ if __name__ == "__main__":
         max_window_size=args.max_window_size,
         beam_size=args.beam_size,
         temperature=args.temperature,
-        start_idx=args.start_idx,
     )
