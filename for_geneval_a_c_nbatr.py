@@ -46,7 +46,7 @@ def generate_single_image(
     jump_floor: float = 1.5,
     mean_floor: float = 3.0,
     min_window_size: int = 3,
-    max_window_size: int = 8,
+    max_window_size: int = 12,
     beam_size: int = 3,
     temperature: float = 0.95,
 ) -> np.ndarray:
