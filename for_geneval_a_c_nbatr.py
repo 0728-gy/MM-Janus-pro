@@ -40,7 +40,7 @@ def generate_single_image(
     prompt: str,
     cfg_weight: float = 5.0,
     image_token_num_per_image: int = 576,
-    baseline_window: int = 8,
+    baseline_window: int = 16,
     k_jump: float = 2,
     k_mean: float = 2,
     jump_floor: float = 1.5,
@@ -111,111 +111,76 @@ def generate_single_image(
         last_hidden_state = outputs.last_hidden_state[:, -1, :]
         history_hidden_states.append(last_hidden_state)
 
-        # 【修改 1】：引入网格宽度 W，切断跨行 Delta 计算
-        W = 24  # 对于 576 像素的网格，宽度固定为 24
-        curr_col = (t_fast - 1) % W
-        
-        # 如果是整张图的第一个 token，或者是每一行的第一个 token，Delta 归零
-        if t_fast == 1 or curr_col == 0:
-            delta_entropies.append(0.0)
-        else:
-            delta_entropies.append(abs(token_entropies[-1] - token_entropies[-2]))
-
         window_size = t_fast - t_slow
 
-        # ============================================================
-        # C. 2D-Aware 判定机制 (含：2D预热、行内分割、行尾审计)
-        # ============================================================
+        # ----------------------
+        # C. 自适应触发判断
+        # ----------------------
         trigger_backtrack = False
-        d = 0
-        beam_d = 0   
+        d      = 0
+        beam_d = 0   # ← 新增：beam search 实际搜索步数（默认与 d 相同）
 
-        W = 24  # 网格宽度
-        curr_idx = t_fast - 1
-        curr_row = curr_idx // W
-        curr_col = curr_idx % W
-        
-        # 统计参数
-        baseline_window = 8 
-        window_size = t_fast - t_slow
+        if t_fast <= baseline_window:
+            t_slow = t_fast
 
-        # --- 1. 构建 2D 统计基准 (L型邻域预热) ---
-        base_ents = []
-        base_deltas = []
-        num_horiz = min(curr_col, baseline_window)
-        if num_horiz > 0:
-            base_ents = token_entropies[curr_idx - num_horiz : curr_idx]
-            base_deltas = delta_entropies[curr_idx - num_horiz : curr_idx]
-        if len(base_ents) < baseline_window and curr_row > 0:
-            needed = baseline_window - len(base_ents)
-            top_end_idx = (curr_row - 1) * W + curr_col + 1
-            top_start_idx = max((curr_row - 1) * W, top_end_idx - needed)
-            if top_end_idx > top_start_idx:
-                base_ents = token_entropies[top_start_idx : top_end_idx] + base_ents
-                base_deltas = delta_entropies[top_start_idx : top_end_idx] + base_deltas
+        elif t_fast > baseline_window and t_fast >= 2:
+            base_ents   = token_entropies[max(0, t_slow - 16) : t_slow]
+            base_deltas = delta_entropies[max(0, t_slow - 16) : t_slow]
 
-        # --- 2. 开始核心逻辑判定 ---
-        if len(base_ents) >= 3:
-            # 计算动态阈值
-            b_mean = sum(base_ents) / len(base_ents)
-            b_std  = math.sqrt(sum((x - b_mean)**2 for x in base_ents) / len(base_ents))
-            bd_mean = sum(base_deltas) / len(base_deltas)
-            bd_std  = math.sqrt(sum((x - bd_mean)**2 for x in base_deltas) / len(base_deltas))
+            base_ent_mean   = sum(base_ents)   / len(base_ents)
+            base_ent_std    = math.sqrt(sum((x - base_ent_mean)**2 for x in base_ents)   / baseline_window)
+            base_delta_mean = sum(base_deltas) / len(base_deltas)
+            base_delta_std  = math.sqrt(sum((x - base_delta_mean)**2 for x in base_deltas) / baseline_window)
 
-            jump_threshold = min(max(jump_floor, bd_mean + k_jump * bd_std), 5.0)
-            mean_threshold = min(max(mean_floor, b_mean  + k_mean * b_std),  8.0)
+            jump_threshold = min(max(jump_floor, base_delta_mean + k_jump * base_delta_std), 5.0)
+            mean_threshold = min(max(mean_floor, base_ent_mean   + k_mean * base_ent_std),  8.0)
 
             current_delta = delta_entropies[-1]
-            avg_window_ent = sum(token_entropies[t_slow:t_fast]) / max(1, window_size)
 
-            # --- 场景 A: 突发惊吓 (立即拦截) ---
+            if t_fast % 20 == 0:
+                avg_window_ent = sum(token_entropies[t_slow:t_fast]) / window_size
+                print(f"[{t_fast}] Δent: {current_delta:.2f} (阈: {jump_threshold:.2f}) | "
+                    f"窗口均值ent: {avg_window_ent:.2f} (阈: {mean_threshold:.2f})")
+
+            # —— 原有双重触发：Δentropy 突变 ——
             if current_delta > jump_threshold and window_size >= min_window_size:
+                avg_window_ent = sum(token_entropies[t_slow:t_fast]) / window_size
                 if avg_window_ent > mean_threshold:
-                    trigger_backtrack = True
-                    d = window_size
-                    print(f"[{t_fast}] 突发回溯! Δ:{current_delta:.2f} > {jump_threshold:.2f}")
-                else:
-                    # 如果 Δ 很大但均值 OK，说明可能只是正常的细节增加
-                    # 我们可以选择提前步进 t_slow，防止窗口变大
-                    t_slow = t_fast 
-
-            # --- 场景 B: 到达行尾 (强制清算，不准漏判) ---
-            elif curr_col == W - 1:
-                if avg_window_ent > mean_threshold:
-                    trigger_backtrack = True
-                    d = window_size
-                    print(f"[{t_fast}] 行尾审计不合格! AvgEnt:{avg_window_ent:.2f}")
-                else:
-                    # 行尾合格，清空慢指针，迎接下一行
-                    t_slow = t_fast
-                    print(f"[{t_fast}] 行尾审计合格，重置指针。")
-
-            # --- 场景 C: 窗口满 (基于审计的差分提交) ---
-            elif window_size >= max_window_size:
-                # 1. 寻找分割点 (寻找最不安分的瞬间)
-                window_deltas = delta_entropies[t_slow:t_fast]
-                max_local_idx = max(range(len(window_deltas)), key=lambda i: window_deltas[i])
-                split_pos = t_slow + max_local_idx + 1
-                
-                # 2. 【核心改进】：对即将被“提交”的前半段进行专项审计
-                first_half_ents = token_entropies[t_slow : split_pos]
-                avg_first_half_ent = sum(first_half_ents) / len(first_half_ents)
-                
-                # 3. 审计判定
-                # 如果连准备提交的前半段都超过了平均阈值，说明这 12 个像素整体都不可信
-                if avg_first_half_ent > mean_threshold:
                     trigger_backtrack = True
                     d = beam_d = window_size
-                    print(f"[{t_fast}] 窗口分割审计失败! 前半段 AvgEnt:{avg_first_half_ent:.2f} > {mean_threshold:.2f}。执行全窗口回溯。")
+                    print(f"Token {t_fast}: 触发回溯! "
+                        f"(Δent: {current_delta:.2f} > {jump_threshold:.2f}, "
+                        f"窗口: {window_size}, 均值ent: {avg_window_ent:.2f} > {mean_threshold:.2f})")
                 else:
-                    # 只有审计通过，才允许“落袋为安”
-                    t_slow = split_pos
-                    print(f"[{t_fast}] 窗口分割审计合格 (前半段 AvgEnt:{avg_first_half_ent:.2f})。提交前半段，当前指针步进至 {t_slow}。")
-        else:
-            # 极初期（整张图最左上角）没有预热样本时
-            if t_fast <= baseline_window:
-                t_slow = t_fast
+                    t_slow=t_fast
+                    
+            elif window_size >= max_window_size:                  # 1. 找窗口内 Δentropy 最大处
+                    window_deltas     = delta_entropies[t_slow:t_fast]
+                    max_local_idx     = max(range(len(window_deltas)), key=lambda i: window_deltas[i])
+                    split_pos         = t_slow + max_local_idx   # 第一段: [t_slow, split_pos)
 
+                    first_half_size   = split_pos - t_slow
+                    # 退化保护：若 split_pos 落在边界，退回到整段
+                    if first_half_size < 1:
+                        first_half_size = window_size
+                        split_pos       = t_fast
+
+                    avg_first_half_ent = sum(token_entropies[t_slow:split_pos]) / first_half_size
+
+                    if avg_first_half_ent > mean_threshold:
+                        # 第一段质量差 → 回滚整窗口，beam search 只覆盖第一段
+                        trigger_backtrack = True
+                        d      = window_size       # 回滚步数（整个窗口都丢）
+                        beam_d = window_size 
+                        
+                        print(f"Token {t_fast}: 触发回溯! (窗口分割@{split_pos}, "
+                            f"第一段均值ent: {avg_first_half_ent:.2f} > {mean_threshold:.2f}, "
+                            f"回滚={d}, beam_search={beam_d}步)")
+                    else:
+                        # 第一段质量OK → slow 推进到分割点，第二段留待后续
+                        t_slow = split_pos
+                        print(f"Token {t_fast}: 窗口分割，第一段提交 "
+                            f"(均值ent: {avg_first_half_ent:.2f} ≤ {mean_threshold:.2f})，slow→{t_slow}")
         
         # ----------------------
         # F. 回溯 + 平行随机采样 + 前瞻最低熵选择 (Lookahead Entropy Selection)
